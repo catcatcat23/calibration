@@ -161,10 +161,10 @@ $$
 
 * **Focal 微调**（多类）
 
-  $$
-  L_{\mathrm{FL}}=-\sum_{i}\big(1-\hat p_i^{(y_i)}\big)^{\gamma}\,\log \hat p_i^{(y_i)}.
-  $$
-* **温度缩放（TS）**：$\mathbf z\mapsto \mathbf z/T$，$T$ 由 Calib-Learn 上的 NLL 选定。
+  
+  $L_{\mathrm{FL}}=-\sum_{i}\big(1-\hat p_i^{(y_i)}\big)^{\gamma}\,\log \hat p_i^{(y_i)}.$
+  
+* **温度缩放（TS）**：$$\mathbf z\mapsto \mathbf z/T$$，T 由 Calib-Learn 上的 NLL 选定。
 * **IOP-OI**（顺序保持 + 置换不变）：
   每样本对 $\mathbf z$ 降序排序得 $z_{(1)}\ge\dots\ge z_{(K)}$，用**同一**单调函数 $f_\theta$ 映射 $z'_{(r)}=f_\theta(z_{(r)})$，再还原原类别顺序并 softmax；Calib-Learn 上最小化 NLL 学 $\theta$（分段线性单调、LBFGS、平滑正则）。
 * **IROvA**：每类 $k$ 拟合单调函数 $g_k$ 近似 $\Pr(y=k\mid s^{(k)})$（$s^{(k)}$ 可用 $z^{(k)}$ 或 margin），再归一化 $\hat q^{(k)}=\hat r^{(k)}/\sum_{j}\hat r^{(j)}$。
