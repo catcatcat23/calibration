@@ -196,7 +196,7 @@ $$
 | IROvA-TS | 组合    | （实现相关） | 中    | 高   | 大数据复杂任务 |
 | KDE-ECE  | 评估方法  | —      | ✅    | —   | 小样本评估   |
 
-> 备注：若 IROvA 各类共享同一单调函数且仅做概率域保序再归一化，则可保持 top-1；若对每类独立拟合 $g_k$ 再归一化，则可能改变 top-1。请按你的实现口径陈述。
+> 备注：若 IROvA 各类共享同一单调函数且仅做概率域保序再归一化，则可保持 top-1；若对每类独立拟合 $g_k$ 再归一化，则可能改变 top-1。
 
 ---
 
@@ -244,8 +244,7 @@ q = softmax(z_prime)
 loss = NLL(q, y) + lambda * smooth_reg(theta)
 optimize theta (LBFGS/Adam)
 ```
-好的 ✅
-我帮你整理成一份完整的 **Markdown 文档**，里面带有公式（可在 GitHub、Typora 等渲染），对四种 **KDE-ECE** 评估方法做系统说明。
+
 
 ---
 
@@ -254,9 +253,8 @@ optimize theta (LBFGS/Adam)
 模型的**置信度 (confidence)** 与**准确性 (accuracy)** 是否一致，是衡量模型是否校准 (calibrated) 的关键指标。
 理想情况下：
 
-$$
-P(y = \hat y \mid c = z) = z, \quad \forall z \in [0,1]
-$$
+
+$P(y = \hat y \mid c = z) = z, \quad \forall z \in [0,1]$
 
 也就是预测置信度 $z$ 应等于真实精度。
 传统的 **ECE (Expected Calibration Error)** 依赖直方图分桶，结果会受 bin 边界影响；而 **KDE (Kernel Density Estimation)** 能平滑估计概率分布，更稳健。
@@ -275,14 +273,12 @@ $$
 
 * 横轴：该类的预测概率
 
-  $$
-  c_i = p_i^{(k)}
-  $$
+  
+  $c_i = p_i^{(k)}$
+
 * 纵轴：是否预测正确
 
-  $$
-  a_i = \mathbf{1}[y_i = k]
-  $$
+  $a_i = \mathbf{1}[y_i = k]$
 
 ### KDE 估计
 
@@ -313,14 +309,11 @@ $$
 
 * 横轴：预测的该类概率
 
-  $$
-  c_i = p_i^{(k)}
-  $$
+  $c_i = p_i^{(k)}$
+  
 * 纵轴：是否真实属于该类
 
-  $$
-  a_i = \mathbf{1}[y_i = k]
-  $$
+  $a_i = \mathbf{1}[y_i = k]$
 
 ### KDE 估计
 
@@ -417,17 +410,3 @@ $$
 | Overall (Top-1) | 1 条曲线 | 每个样本的最大概率（top-1）  | 快速评估整体校准     |
 
 ---
-
-✅ 推荐在报告/README 中附上 **四个方法的曲线图示例**，比如：
-
-* Pred-class-wise / True-class-wise → 多条曲线
-* Overall → 单条曲线
-* Multiclass → 只给数值，不画图
-
----
-
-要不要我帮你画一张 **总对比图（4 种方法的示例 reliability diagram）**，放在文档最后当视觉总结？
-
----
-
-如果你还要\*\*严格“保持准确率版”**或**“可能改动准确率版”\*\*两套措辞，我也可以把本文再分成 A/B 两个 README 版本，方便直接替换。
