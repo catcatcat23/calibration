@@ -244,6 +244,189 @@ q = softmax(z_prime)
 loss = NLL(q, y) + lambda * smooth_reg(theta)
 optimize theta (LBFGS/Adam)
 ```
+好的 ✅
+我帮你整理成一份完整的 **Markdown 文档**，里面带有公式（可在 GitHub、Typora 等渲染），对四种 **KDE-ECE** 评估方法做系统说明。
+
+---
+
+# 📘 基于 KDE 的四种校准评估方法
+
+模型的**置信度 (confidence)** 与**准确性 (accuracy)** 是否一致，是衡量模型是否校准 (calibrated) 的关键指标。
+理想情况下：
+
+$$
+P(y = \hat y \mid c = z) = z, \quad \forall z \in [0,1]
+$$
+
+也就是预测置信度 $z$ 应等于真实精度。
+传统的 **ECE (Expected Calibration Error)** 依赖直方图分桶，结果会受 bin 边界影响；而 **KDE (Kernel Density Estimation)** 能平滑估计概率分布，更稳健。
+
+---
+
+## 1️⃣ Pred-class-wise ECE（预测类口径）
+
+### 定义
+
+对每个类别 $k$，只考虑 **被预测为该类** 的样本：
+
+$$
+\mathcal{I}_k^{pred} = \{ i \mid \hat y_i = k \}
+$$
+
+* 横轴：该类的预测概率
+
+  $$
+  c_i = p_i^{(k)}
+  $$
+* 纵轴：是否预测正确
+
+  $$
+  a_i = \mathbf{1}[y_i = k]
+  $$
+
+### KDE 估计
+
+$$
+\pi_k(z) = \frac{\sum_{i \in \mathcal{I}_k^{pred}} a_i K_h(z - c_i)}{\sum_{i \in \mathcal{I}_k^{pred}} K_h(z - c_i)}
+$$
+
+### 误差
+
+$$
+\mathrm{ECE}_k = \mathbb{E}_{i \in \mathcal{I}_k^{pred}} \Big| \pi_k(c_i) - c_i \Big|
+$$
+
+返回每个类别的 ECE 值。
+
+**特点**
+
+* 每类一条曲线（K 条线绘制在同一图上）。
+* 适合诊断：哪些类过置信 / 欠置信。
+
+---
+
+## 2️⃣ True-class-wise ECE（真实类口径）
+
+### 定义
+
+对每个类别 $k$，考虑 **所有样本**，分析该类概率分布是否合理：
+
+* 横轴：预测的该类概率
+
+  $$
+  c_i = p_i^{(k)}
+  $$
+* 纵轴：是否真实属于该类
+
+  $$
+  a_i = \mathbf{1}[y_i = k]
+  $$
+
+### KDE 估计
+
+$$
+\pi_k(z) = \frac{\sum_{i=1}^N a_i K_h(z - p_i^{(k)})}{\sum_{i=1}^N K_h(z - p_i^{(k)})}
+$$
+
+### 误差
+
+$$
+\mathrm{ECE}_k = \mathbb{E}_i \Big| \pi_k(p_i^{(k)}) - p_i^{(k)} \Big|
+$$
+
+**特点**
+
+* 每类一条曲线（K 条线）。
+* 是 **one-vs-rest** 视角，反映真实类的概率刻度是否合理。
+* 可用于发现某些类系统性低估或高估。
+
+---
+
+## 3️⃣ Multiclass ECE（多类整体口径）
+
+### 定义
+
+对每个样本 $i$，同时考虑它的所有类别概率：
+
+$$
+\text{gap}_i = \sum_{k=1}^K \Big| \pi_k(p_i^{(k)}) - p_i^{(k)} \Big|
+$$
+
+### 误差
+
+$$
+\mathrm{ECE}_{multi} = \frac{1}{N}\sum_{i=1}^N \text{gap}_i
+$$
+
+$$
+\mathrm{MCE}_{multi} = \max_i \text{gap}_i
+$$
+
+**特点**
+
+* 输出一个全局指标（无曲线）。
+* 定量衡量整体校准水平。
+* 不区分类别，适合整体比较模型效果。
+
+---
+
+## 4️⃣ Overall (Top-1) ECE（整体 top-1 口径）
+
+### 定义
+
+只看每个样本的 top-1 概率：
+
+$$
+c_i = \max_k p_i^{(k)}, \quad a_i = \mathbf{1}[\hat y_i = y_i]
+$$
+
+* 横轴：top-1 置信度
+* 纵轴：是否预测正确
+
+### KDE 估计
+
+$$
+\pi(z) = \frac{\sum_{i=1}^N a_i K_h(z - c_i)}{\sum_{i=1}^N K_h(z - c_i)}
+$$
+
+### 误差
+
+$$
+\mathrm{ECE}_{overall} = \frac{1}{N} \sum_{i=1}^N \Big| \pi(c_i) - c_i \Big|
+$$
+
+$$
+\mathrm{MCE}_{overall} = \max_i \Big| \pi(c_i) - c_i \Big|
+$$
+
+**特点**
+
+* 只画一条曲线（最经典的 reliability diagram）。
+* 与标准 ECE 定义最接近。
+* 适合快速评估整体校准。
+
+---
+
+## 📊 总结对比
+
+| 方法              | 曲线数量  | 样本选择              | 适用场景         |
+| --------------- | ----- | ----------------- | ------------ |
+| Pred-class-wise | K 条曲线 | 被预测为该类的样本         | 分析预测类是否过/欠置信 |
+| True-class-wise | K 条曲线 | 所有样本（one-vs-rest） | 分析真实类的概率刻度偏差 |
+| Multiclass      | 无（指标） | 每个样本所有类别概率        | 整体全局校准指标     |
+| Overall (Top-1) | 1 条曲线 | 每个样本的最大概率（top-1）  | 快速评估整体校准     |
+
+---
+
+✅ 推荐在报告/README 中附上 **四个方法的曲线图示例**，比如：
+
+* Pred-class-wise / True-class-wise → 多条曲线
+* Overall → 单条曲线
+* Multiclass → 只给数值，不画图
+
+---
+
+要不要我帮你画一张 **总对比图（4 种方法的示例 reliability diagram）**，放在文档最后当视觉总结？
 
 ---
 
