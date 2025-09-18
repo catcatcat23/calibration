@@ -1,0 +1,75 @@
+# ==== OS / Editors ====
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.sublime-*
+
+# ==== Python / Jupyter 缓存 ====
+__pycache__/
+*.py[cod]
+*.pyo
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ==== 虚拟环境 / 本地配置 ====
+.venv/
+venv/
+env/
+.env
+.env.*
+*.env
+pip-wheel-metadata/
+
+# ==== 构建/发行产物 ====
+build/
+dist/
+.eggs/
+*.egg-info/
+*.egg
+
+# ==== 日志 / 临时文件 ====
+*.log
+logs/
+log/
+tmp/
+temp/
+*.tmp
+*.bak
+*.orig
+*.swp
+*.swo
+
+# ==== 测试与类型检查缓存 ====
+pytest_cache/
+.pytest_cache/
+.mypy_cache/
+.pytype/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+
+# ==== 深度学习训练产物 / 可视化输出 ====
+results/
+runs/
+outputs/
+checkpoints/
+vis_rgbwhite/
+tensorboard/
+tb_logs/
+lightning_logs/
+events.out.tfevents.*
+
+# 常见模型权重/导出文件（建议用 Git LFS）
+*.pt
+*.pth
+*.pt.tar
+*.pth.tar
+*.ckpt
+*.onnx
+*.h5
+*.tflite
+
+# ==== 你项目中已出现的可忽略结果文件 ====
+calibrate_results_*.json
