@@ -22,6 +22,8 @@ from train_data import get_train_csv
 from algo_test_utils import *
 from models.Calibrate import *
 import json
+from tqdm.auto import tqdm
+
 
 
 
@@ -325,18 +327,30 @@ def train(train_loader, model, criterion_bos, criterion_bom, cl_loss, optimizer,
     return losses.avg, accuracies.avg
 
 def train_no_cl(train_loader, model, criterion_bos, criterion_bom, cl_loss, optimizer, gpu_exists, use_amp=False, scaler=None, kd_config=None):
+    
+    
+    """
+    说明：
+    - model(img1, img2) 统一返回“像 logits”的张量：
+        * TS: logits/T
+        * ETS: log(q) （CrossEntropy/Focal 依然正确）
+    - criterion_bom / criterion_bos 可以是 CrossEntropyLoss 或支持 logits 的 FocalLoss
+    - KD:
+        * kd_type == "ce" : KL(teacher || student) 的稳定写法（teacher prob × (log teacher - log student)）
+        * kd_type == "mse": 对概率做 MSE（student 用 softmax(output)；ETS 时 softmax(log(q))=q）
+    """ 
     losses = AverageMeter()
     accuracies = AverageMeter()
 
     # switch to train mode
     model.train()
-    model.pre_fintune() # 冻结原始模型权重
     if kd_config is not None:
         kd_ratio = kd_config['kd_ratio']
         teacher_model = kd_config['teacher_model']
         teacher_model.eval()
         kd_type = kd_config['kd_type']
         T = kd_config['temperature']
+        eps = 1e-8
     # label1是ref_y, label2是insp_y, binary_y = binary_y
     for batch_id, (img1, img2, label1, label2, binary_y) in enumerate(train_loader):  #, position
 #         print(img1.shape, img2.shape, type(label1), type(label2), type(binary_y), type(position))
@@ -521,7 +535,8 @@ def val(val_loader, model, criterion_bos, criterion_bom, gpu_exists, visualize=F
         return losses.avg, accuracies_binary.avg, accuracies_mclass.avg, recall_bi, recall_mclass, val_label_positions, \
                 precision_list, recall_list, f1score_list, thresholds_list, output_bos_th, output_bom_th, bos_labels, bom_labels
     
-def val_no_cl(val_loader, model, criterion_bos, criterion_bom, gpu_exists, visualize=False, use_amp=False, selection_score='recall'):
+def val_no_cl(val_loader, model, criterion_bos, criterion_bom, gpu_exists,
+              visualize=False, use_amp=False, selection_score='recall'):
 
     if selection_score == 'recall':
         metric_idx = 1
@@ -534,77 +549,108 @@ def val_no_cl(val_loader, model, criterion_bos, criterion_bom, gpu_exists, visua
     if visualize:
         val_imgs = []
 
-    # switch to evaluate mode
     model.eval()
     val_label_positions = []
-    output_bos_list = []
-    label_binary_list = []
-    output_bom_list = []
-    label_mclass_list = []
+    output_bos_list, label_binary_list = [], []
+    output_bom_list, label_mclass_list = [], []
 
-    for batch_id, (img1, img2, label1, label2, binary_y) in enumerate(val_loader): #, position
+    device_type = 'cuda'
+    amp_enabled = (use_amp and gpu_exists)
 
-        if gpu_exists:
-            img1, img2, label1, label2, binary_y = torch.FloatTensor(img1).cuda(), torch.FloatTensor(img2).cuda(), torch.FloatTensor(
-                label1).cuda(), torch.FloatTensor(label2).cuda(), torch.FloatTensor(binary_y).cuda()
-        else:
-            img1, img2, label1, label2, binary_y = torch.FloatTensor(img1), torch.FloatTensor(img2), torch.FloatTensor(label1), torch.FloatTensor(
-                label2), torch.FloatTensor(binary_y)
+    with torch.no_grad():
+        for batch_id, (img1, img2, label1, label2, binary_y) in enumerate(val_loader):
+            if gpu_exists:
+                img1 = torch.FloatTensor(img1).cuda()
+                img2 = torch.FloatTensor(img2).cuda()
+                label1 = torch.FloatTensor(label1).cuda()
+                label2 = torch.FloatTensor(label2).cuda()
+                binary_y = torch.FloatTensor(binary_y).cuda()
+            else:
+                img1 = torch.FloatTensor(img1)
+                img2 = torch.FloatTensor(img2)
+                label1 = torch.FloatTensor(label1)
+                label2 = torch.FloatTensor(label2)
+                binary_y = torch.FloatTensor(binary_y)
 
-        label_binary = binary_y.type(torch.int64)
-        label2 = label2.type(torch.int64)
-        # compute loss and accuracy
-        with torch.no_grad():
-            with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
+            label_binary = binary_y.type(torch.int64)
+            label2 = label2.type(torch.int64)
+
+            with torch.autocast(device_type=device_type, dtype=torch.float16, enabled=amp_enabled):
                 output_bos, output_bom = model(img1, img2)
-                # label_binary = (label1 == label2).type(torch.float32).reshape([-1,1])
                 if output_bos is not None:
                     loss = (criterion_bos(output_bos, label_binary) + criterion_bom(output_bom, label2)) / 2
                 else:
                     loss = criterion_bom(output_bom, label2)
 
-        batch_size = img1.size(0)
-        if output_bos is not None:
-            acc_binary = accuracy(output_bos, label_binary, topk=(1,))
-            accuracies_binary.update(acc_binary[0], batch_size)
-            output_bos_list.append(output_bos)
-            output_bos_np = output_bos.detach().cpu().numpy()
-        else:
-            output_bos_np = 0*output_bom.detach().cpu().numpy()
+            batch_size = img1.size(0)
+            losses.update(loss.item(), batch_size)
 
-        acc_mclass = accuracy(output_bom, label2, topk=(1,))
-        # update record
-        losses.update(loss.item(), batch_size)
-        accuracies_mclass.update(acc_mclass[0], batch_size)
-        label_binary_list.append(label_binary)
-        output_bom_list.append(output_bom)
-        label_mclass_list.append(label2)
+            # 多分类准确率
+            acc_mclass = accuracy(output_bom, label2, topk=(1,))
+            accuracies_mclass.update(acc_mclass[0], batch_size)
+            output_bom_list.append(output_bom)
+            label_mclass_list.append(label2)
 
-    if output_bos is not None:
+            # 二分类（BOS）准确率（仅当存在 BOS 输出）
+            if output_bos is not None:
+                acc_binary = accuracy(output_bos, label_binary, topk=(1,))
+                accuracies_binary.update(acc_binary[0], batch_size)
+                output_bos_list.append(output_bos)
+                label_binary_list.append(label_binary)
+
+    # -------- 聚合阶段：全部加保护 --------
+    has_bos = (len(output_bos_list) > 0)
+
+    # 多分类聚合（保证非空再 cat）
+    if len(output_bom_list) > 0:
+        output_bom_all = torch.cat(output_bom_list, dim=0)
+        label_mclass_all = torch.cat(label_mclass_list, dim=0)
+    else:
+        # 空验证集的兜底（尽量返回空张量/None，避免后续再炸）
+        output_bom_all = None
+        label_mclass_all = None
+
+    # 二分类（BOS）聚合
+    if has_bos:
         label_binary_all = torch.cat(label_binary_list, dim=0)
         output_bos_all = torch.cat(output_bos_list, dim=0)
         recall_bi = classk_metric(output_bos_all, label_binary_all, 1, input_type='torch')[metric_idx]
     else:
+        label_binary_all = None
+        output_bos_all = None
         recall_bi = 0
 
-    output_bom_all = torch.cat(output_bom_list, dim=0)
-    label_mclass_all = torch.cat(label_mclass_list, dim=0)
-    # print(output_bos_all, label_binary_all)
-    recall_mclass = classk_metric(output_bom_all, label_mclass_all, -1, input_type='torch')[metric_idx]
-
-    precision_list, recall_list, f1score_list, thresholds_list = get_p_r_list(output_bos_all, output_bom_all, label_binary_all, label_mclass_all)
-
-    output_bos_th = output_bos_all.detach().clone()
-    output_bom_th = output_bom_all.detach().clone()
-    bos_labels = label_binary_all.detach().clone()
-    bom_labels = label_mclass_all.detach().clone()
-    
-    if visualize:
-        return losses.avg, accuracies_binary.avg, accuracies_mclass.avg, recall_bi, recall_mclass, val_label_positions, \
-                val_imgs, precision_list, recall_list, f1score_list, thresholds_list, output_bos_th, output_bom_th, bos_labels, bom_labels
+    # PR/F1 列表：只有在 BOS 存在时才计算二分类相关；否则给空列表即可
+    if (output_bom_all is not None) and has_bos:
+        precision_list, recall_list, f1score_list, thresholds_list = \
+            get_p_r_list(output_bos_all, output_bom_all, label_binary_all, label_mclass_all)
     else:
-        return losses.avg, accuracies_binary.avg, accuracies_mclass.avg, recall_bi, recall_mclass, val_label_positions, \
-                precision_list, recall_list, f1score_list, thresholds_list, output_bos_th, output_bom_th, bos_labels, bom_labels
+        precision_list = recall_list = f1score_list = thresholds_list = []
+
+    # 准备返回的“快照”张量（没有 BOS 就返回 None）
+    output_bos_th = (output_bos_all.detach().clone() if has_bos else None)
+    bos_labels   = (label_binary_all.detach().clone() if has_bos else None)
+
+    if output_bom_all is not None:
+        output_bom_th = output_bom_all.detach().clone()
+        bom_labels    = label_mclass_all.detach().clone()
+    else:
+        output_bom_th = None
+        bom_labels    = None
+
+    if visualize:
+        return (losses.avg, accuracies_binary.avg, accuracies_mclass.avg,
+                recall_bi, classk_metric(output_bom_all, label_mclass_all, -1, input_type='torch')[metric_idx] if output_bom_all is not None else 0,
+                val_label_positions, val_imgs,
+                precision_list, recall_list, f1score_list, thresholds_list,
+                output_bos_th, output_bom_th, bos_labels, bom_labels)
+    else:
+        return (losses.avg, accuracies_binary.avg, accuracies_mclass.avg,
+                recall_bi, classk_metric(output_bom_all, label_mclass_all, -1, input_type='torch')[metric_idx] if output_bom_all is not None else 0,
+                val_label_positions,
+                precision_list, recall_list, f1score_list, thresholds_list,
+                output_bos_th, output_bom_th, bos_labels, bom_labels)
+
 
 def load_calibrate_model(args,  model):
     print(f'Loading checkpoint {args.resume}')
@@ -928,6 +974,7 @@ def main(args):
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size,
                                                    shuffle=True, num_workers=n_workers, pin_memory=True)
 
+
     if args.aug_img:
         sharpness_save =args.region + '-' + str(args.sharpness_factor) + '-' + str(args.sharpness_p)
         os.makedirs(sharpness_save, exist_ok=True)
@@ -971,7 +1018,7 @@ def main(args):
     criterion_bos = FocalLoss(gamma=gamma, size_average=True, weighted=weighted_loss, label_smooth=smooth)
     criterion_bom = FocalLoss(gamma=gamma, size_average=True, weighted=weighted_loss, label_smooth=smooth)
 
-    if  not args.funtune:
+    if  args.fintune == False:
         print(f"不进行校准fintune")
         p_r_dir = os.path.join(os.path.dirname(args.resume), args.calibrate_dataset, f'T_{args.T_lower}_{args.T_upper}', 'no_fine_tune', 'p_r')
         bos_ECE_results_save_path = os.path.join(os.path.dirname(args.resume), args.calibrate_dataset, f'T_{args.T_lower}_{args.T_upper}', 'no_fine_tune', 'bos_ece')
@@ -1214,11 +1261,29 @@ def main(args):
             print(f"cl_loss = ContrastiveLoss")
             cl_loss = ContrastiveLoss()
 
+        val_loader = zip(val_ref_image_batches, val_insp_image_batches, val_ref_image_label_batches, val_insp_image_label_batches, val_binary_label_batchs)
+
+        (val_losses, val_acc_bi, val_acc_mc, val_recall_bi, val_recall_mclass,
+        val_label_positions, val_imgs, precision_list, recall_list, f1score_list, thresholds_list,
+        output_bos_th, output_bom_th, bos_labels, bom_labels) = \
+            valer(val_loader, output_type, calibrate_models, criterion_bos, criterion_bom,
+                gpu_exists, True, use_amp, selection_score)
+        #   选择校准方式（一次性）
+        per_cls = args.ets_per_class or (args.calibrate_method in ('ets_pc','ets-pc'))
+        calibrate_models.set_calibrate_method(
+            method=args.calibrate_method,      # 'ts' | 'ets' | 'ets_pc'
+            per_class=per_cls,
+            num_classes_bom=3,   # ETS 必填其一
+            num_classes_bos=2      # ETS 必填其一
+        )
+
+
+
+        calibrate_models.pre_fintune()
         # define optimizer
         optimizer, scheduler, scaler = set_fintune_param(optimizer_type, calibrate_models, init_lr, weight_decay, lr_schedule, use_amp, lr_step_size, lr_gamma)
 
-        val_losses, val_acc_bi, val_acc_mc, val_recall_bi, val_recall_mclass, val_label_positions, val_imgs, \
-        precision_list, recall_list, f1score_list, thresholds_list = valer(val_loader, output_type, calibrate_models, criterion_bos, criterion_bom, gpu_exists, True, use_amp, selection_score)
+
 
         print(
             f'Before finetune: val_losses={val_losses}, mclass_val_acc={val_acc_mc}, binary_val_acc={val_acc_bi},  '
@@ -1254,63 +1319,103 @@ def main(args):
 
         tb_writer.add_graph(calibrate_models, (dummy_input1, dummy_input2))
 
-        for epoch in range(start_epoch, epochs):
-
-            val_loader = zip(val_ref_image_batches, val_insp_image_batches, val_ref_image_label_batches, val_insp_image_label_batches, val_binary_label_batchs)
-
+        for epoch in tqdm(range(start_epoch, epochs), desc="epoch", initial=start_epoch, total=epochs-start_epoch):
+            min_len = min(len(val_ref_image_batches), len(val_insp_image_batches),
+                  len(val_ref_image_label_batches), len(val_insp_image_label_batches),
+                  len(val_binary_label_batchs))
+            val_loader = tqdm(
+                zip(val_ref_image_batches, val_insp_image_batches,
+                    val_ref_image_label_batches, val_insp_image_label_batches,
+                    val_binary_label_batchs),
+                total=min_len, desc=f"val at epoch {epoch}", leave=False, dynamic_ncols=True
+            )
+            val_loss = float('nan')
+            val_acc_bi = val_acc_mc = float('nan')
+            val_recall_bi = val_recall_mclass = float('nan')
+            val_label_positions = {}
+            precision_list = recall_list = f1score_list = thresholds_list = []
+            output_bos_th = output_bom_th = bos_labels = bom_labels = None
+            val_imgs = []  
+    
+            # 仅在 visualize=True 时会被真正赋值
             # adjust learning rate based on scheduling condition
             # adjust_learning_rate(optimizer, init_lr, epoch, decay_points)
             # train the model for 1 epoch
+            # —— 2) 训练一轮 —— 
             if 'CL' in output_type:
                 epoch_time_start = time.time()
-                train_loss, train_acc = train(train_loader, calibrate_models, criterion_bos, criterion_bom, cl_loss, optimizer, gpu_exists,
-                                            use_amp, scaler, kd_config)
+                train_loss, train_acc = train(train_loader_tqdm, calibrate_models, criterion_bos, criterion_bom,
+                                            cl_loss, optimizer, gpu_exists, use_amp, scaler, kd_config)
                 epoch_time = time.time() - epoch_time_start
                 scheduler.step()
-                # validate the model
-                # with torch.no_grad():
-                val_loss, val_acc_bi, val_acc_mc, val_recall_bi, val_recall_mclass, val_label_positions, precision_list, recall_list, f1score_list, thresholds_list = val(val_loader,
-                                                                                                            calibrate_models,
-                                                                                                            criterion_bos,
-                                                                                                            criterion_bom,
-                                                                                                            gpu_exists,
-                                                                                                            use_amp=use_amp,
-                                                                                                            selection_score=selection_score)
+
+                # —— 3) 验证（CL 分支）——
+                try:
+                    # 注意：visualize=False 时，val(...) 返回 14 个值
+                    (val_loss, val_acc_bi, val_acc_mc, val_recall_bi, val_recall_mclass,
+                    val_label_positions,
+                    precision_list, recall_list, f1score_list, thresholds_list,
+                    output_bos_th, output_bom_th, bos_labels, bom_labels) = val(
+                        val_loader, calibrate_models, criterion_bos, criterion_bom, gpu_exists,
+                        visualize=False, use_amp=use_amp, selection_score=selection_score
+                    )
+                except Exception as e:
+                    traceback.print_exc()
+                    tqdm.write(f"[VAL-CL] 本轮验证异常，已跳过：{e}")
 
             else:
                 epoch_time_start = time.time()
-                train_loss, train_acc = train_no_cl(train_loader, calibrate_models, criterion_bos, criterion_bom, cl_loss, optimizer, gpu_exists,
-                                            use_amp, scaler, kd_config)
+                train_loader_tqdm = tqdm(train_loader, total=len(train_loader),
+                                        desc=f"train[{epoch}]", leave=False, dynamic_ncols=True)
+                train_loss, train_acc = train_no_cl(train_loader_tqdm, calibrate_models, criterion_bos, criterion_bom,
+                                                    cl_loss, optimizer, gpu_exists, use_amp, scaler, kd_config)
                 epoch_time = time.time() - epoch_time_start
                 scheduler.step()
-                # validate the model
-                # with torch.no_grad():
-                val_loss, val_acc_bi, val_acc_mc, val_recall_bi, val_recall_mclass, val_label_positions, 
-                precision_list, recall_list, f1score_list, thresholds_list = val_no_cl(val_loader,
-                                                                                            calibrate_models,
-                                                                                            criterion_bos,
-                                                                                            criterion_bom,
-                                                                                            gpu_exists,
-                                                                                            use_amp=use_amp,
-                                                                                            selection_score=selection_score)
+
+                # —— 3) 验证（no-CL 分支）——
+                try:
+                    # 返回 14 个值；左侧用括号包住，支持安全换行
+                    (val_loss, val_acc_bi, val_acc_mc, val_recall_bi, val_recall_mclass,
+                    val_label_positions,
+                    precision_list, recall_list, f1score_list, thresholds_list,
+                    _, _, _, _) = val_no_cl(
+                        val_loader, calibrate_models, criterion_bos, criterion_bom, gpu_exists,
+                        visualize=False, use_amp=use_amp, selection_score=selection_score
+                    )
+                except Exception as e:
+                    traceback.print_exc()
+                    tqdm.write(f"[VAL-noCL] 本轮验证异常，已跳过：{e}")
+
+            # —— 4) 统一日志输出（对 NaN 友好）——
+            def _fmt(x):
+                try:
+                    return f"{float(x):.4f}" if x == x else "NaN"
+                except Exception:
+                    return "NaN"
+
+            tqdm.write(
+                f"[ep {epoch}] train_loss={_fmt(train_loss)} | "
+                f"val_loss={_fmt(val_loss)} | "
+                f"acc_mc={_fmt(val_acc_mc)}% | acc_bi={_fmt(val_acc_bi)}% | "
+                f"recall_mc={_fmt(val_recall_mclass)}% | recall_bi={_fmt(val_recall_bi)}%"
+            )
 
             plot_cur_T_p_r(calibrate_models, p_r_dir, precision_list, recall_list, f1score_list, thresholds_list)
 
-            # record loss and other metrics
-            epoch_train_losses.append(train_loss)
+            # —— 5) 记录指标（确保 .cpu().numpy() 之前有数值；否则可跳过）——
+            epoch_train_losses.append(float(train_loss))
             epoch_train_accuracies.append(train_acc.cpu().numpy())
-            epoch_val_losses.append(val_loss)
+            epoch_val_losses.append(float(val_loss))
             epoch_val_accuracies_mclass.append(val_acc_mc.cpu().numpy())
             epoch_val_accuracies_binary.append(val_acc_bi.cpu().numpy())
 
             current_metric_score = val_acc_bi + val_acc_mc + (val_recall_bi + val_recall_mclass) * 150
-            
-            tb_writer.add_scalar('train_loss', train_loss, epoch)
+
+            tb_writer.add_scalar('train_loss', float(train_loss), epoch)
             tb_writer.add_scalar('train_acc', train_acc.cpu().numpy(), epoch)
-            tb_writer.add_scalar('val_loss', val_loss, epoch)
+            tb_writer.add_scalar('val_loss', float(val_loss) if val_loss == val_loss else 0.0, epoch)
             tb_writer.add_scalar('val_acc_mc', val_acc_mc.cpu().numpy(), epoch)
             tb_writer.add_scalar('val_acc_bi', val_acc_bi.cpu().numpy(), epoch)
-            tb_writer.add_scalar('current_metric_score', current_metric_score, epoch)
 
             if (save_checkpoint and (run_mode == 'train' or run_mode == 'train_resume')):
                 state = {
@@ -1550,7 +1655,7 @@ if __name__ == '__main__':
     parser.add_argument('--img_type', default='png', type=str)
     parser.add_argument('--special_data', default='test_csv', type=str, help="选择不同的数据集配置")
     parser.add_argument('--aug_img', default=False, type=bool)
-    parser.add_argument('--funtune', default=False, type=bool)
+    parser.add_argument('--fintune', default=False, type=bool)
     parser.add_argument('--T_lower', default=0.5, type=float)
 
     parser.add_argument('--T_upper', default=2, type=float)
@@ -1559,7 +1664,9 @@ if __name__ == '__main__':
     parser.add_argument('--thres_l', default=0.5, type=float)
     parser.add_argument('--thres_u', default=1, type=float)
     parser.add_argument('--default_thres', default=0.8, type=float)
-    
+
+    parser.add_argument('--ets_per_class', default=False,help='ETS 是否为每个类别单独温度')
+    parser.add_argument('--calibrate_method',type=str, default='ts', choices=['ts', 'ets', 'ets_pc', 'ets-pc'],help='ts: 温度缩放；ets: 三组件；ets_pc: ETS按类温度')
     parser.add_argument('--calibrate_dataset', default='calibrate_test', type=str)
     parser.add_argument('--ECE_calcu_type', default='Multi_ECE', type=str, choices=['ECE', 'Ada_ECE', 'Multi_ECE', 'Multi_Ada_ECE', 'Classwise_ECE', 'Classwise_Ada_ECE', 'KDE', 'Classwise_KDE', 'Multi_KDE', 'TrueKDE'])
 
