@@ -4,180 +4,210 @@ import torch.nn.functional as F
 import numpy as np
 
 class Calibrate_Model(nn.Module):
-    def __init__(self, model, T = None):
+    """
+    calibrate_method:
+      - 'ts'      : 温度缩放，forward 返回 logits/T
+      - 'ets'     : ETS(三组件)，forward 返回 log(q) 作为 "logits"
+      - 'ets_pc'  : ETS + 按类温度（每类一个 T）
+    非惰性：选择 ETS 时立即创建 α 参数（需传入类别数）
+    """
+    def __init__(self, model, T=None):
         super().__init__()
         self.model = model
+        self.T = nn.Parameter(torch.tensor(1.0 if T is None else T, dtype=torch.float32))
 
-        if T is not None:
-            self.T = nn.Parameter(torch.tensor(T, dtype=torch.float32))  # 使其成为 nn.Parameter
+        # 统一模式开关（默认 TS），对外一律“像 logits”
+        self.calib_method = 'ts'
+        self._returns_log_prob = False  # 我们统一把输出当 logits 用（ETS 返回 log(q)）
+
+        # ===== ETS 相关（非惰性）=====
+        self._etsm_enabled = False
+        self._etsm_per_class = False
+        self._etsm_eps = 1e-8
+        self._etsm_w_logits = None
+        self._etsm_alpha_raw_bos = None
+        self._etsm_alpha_raw_bom = None
+        self._etsm_init_alpha = 1.0
+        # 记录类别数，便于校验
+        self._num_classes_bos = None
+        self._num_classes_bom = None
+
+    # ========= 主入口：由 args 驱动，非惰性创建 α ========= 🔧
+    def set_calibrate_method(self, method: str,
+                             per_class: bool = False,
+                             init_T: float = 1.0,
+                             num_classes_bom: int = None,
+                             num_classes_bos: int = None):
+        """
+        参数：
+          method: 'ts' | 'ets' | 'ets_pc'
+          per_class: ETS 是否按类温度
+          init_T: ETS 初始 T（α=1/T）
+          num_classes_bom/bos: 对应头的类别数（ETS 下必需；TS 可忽略）
+        """
+        method = (method or 'ts').lower()
+        if method == 'ts':
+            self.calib_method = 'ts'
+            self._returns_log_prob = False
+            self._etsm_enabled = False
+            return
+
+        # ETS / ETS_PC
+        if num_classes_bom is None and num_classes_bos is None:
+            raise ValueError("ETS 需要提供 num_classes_bom 或 num_classes_bos（至少一个头的 K）")
+
+        self._num_classes_bos = num_classes_bos
+        self._num_classes_bom = num_classes_bom
+        self._etsm_per_class = bool(per_class or method in ('ets_pc','ets-pc'))
+        self._etsm_eps = 1e-8
+        self._etsm_enabled = True
+        self._etsm_init_alpha = 1.0 / max(init_T, 1e-6)
+
+        # 立即创建参数（非惰性） 🔧
+        self._create_ets_params()
+
+        self.calib_method = 'ets_pc' if self._etsm_per_class else 'ets'
+        self._returns_log_prob = False  # 对外仍然当作 logits 用
+    def _infer_device(self):
+        # 取已有参数的 device；优先骨干，其次 T
+        for p in self.model.parameters():
+            return p.device
+        return self.T.device
+    # ========= 立即创建 ETS 参数（非惰性） ========= 🔧
+    def _create_ets_params(self):
+        # 3 个混合权重（softmax 约束）
+        self._etsm_w_logits = nn.Parameter(torch.zeros(3, dtype=torch.float32))
+        device = self._infer_device()
+        init_raw = float(np.log(np.exp(self._etsm_init_alpha) - 1.0))  # α = softplus(raw)+eps
+        # bos 头
+        if self._num_classes_bos is not None:
+            if self._etsm_per_class:
+                self._etsm_alpha_raw_bos = nn.Parameter(torch.full(
+                    (self._num_classes_bos,), init_raw, dtype=torch.float32, device=device))
+            else:
+                self._etsm_alpha_raw_bos = nn.Parameter(torch.tensor([init_raw], dtype=torch.float32, device=device))
         else:
-            self.T = nn.Parameter(torch.ones(1, dtype=torch.float32))  # 初始化为 1
+            self._etsm_alpha_raw_bos = None
 
+        # bom 头
+        if self._num_classes_bom is not None:
+            if self._etsm_per_class:
+                self._etsm_alpha_raw_bom = nn.Parameter(torch.full(
+                    (self._num_classes_bom,), init_raw, dtype=torch.float32,device=device))
+            else:
+                self._etsm_alpha_raw_bom = nn.Parameter(torch.tensor([init_raw], dtype=torch.float32,device=device))
+        else:
+            self._etsm_alpha_raw_bom = None
+
+    # ========= forward：统一调用，不做惰性初始化 =========
+    def forward(self, img1, img2):
+        if self.calib_method.startswith('ets') and self._etsm_enabled:
+            return self._forward_ets_as_logits(img1, img2)
+
+        # TS：返回 logits / T
+        logits_bos, logits_bom = self.model(img1, img2)
+        out_bos = None if logits_bos is None else logits_bos / self.T
+        out_bom = None if logits_bom is None else logits_bom / self.T
+        self._returns_log_prob = False
+        return out_bos, out_bom
+
+    def calibrate_test(self, img1, img2):
+        self.eval()
+        with torch.no_grad():
+            return self(img1, img2)
+
+    # ========= 冻结骨干，只学校准参数 =========
+    def pre_fintune(self):
+        for p in self.model.parameters():
+            p.requires_grad = False
+
+        if self.calib_method == 'ts':
+            self.T.requires_grad = True
+        else:
+            # ETS：w 与 α 可训练（非惰性时必定已存在）
+            assert self._etsm_w_logits is not None, "ETS 参数未初始化；请先 set_calibrate_method(..., num_classes_*)"
+            self._etsm_w_logits.requires_grad = True
+            if self._etsm_alpha_raw_bos is not None:
+                self._etsm_alpha_raw_bos.requires_grad = True
+            if self._etsm_alpha_raw_bom is not None:
+                self._etsm_alpha_raw_bom.requires_grad = True
+            # 如需同时学校准全局 T，可打开：
+            # self.T.requires_grad = True
+
+    # ========= 其他工具（保持你原来的） =========
     def compile_model(self):
         self.model = torch.jit.script(self.model)
 
-    def forward(self, img1, img2):
-        logits_output_bos, logits_output_bom = self.model(img1, img2)
-
-        if logits_output_bos is not None:
-            output_bos = logits_output_bos / self.T
-        else:
-            output_bos = None
-        if logits_output_bom is not None:
-            output_bom = logits_output_bom / self.T 
-        else:
-            output_bom = None
-
-        return output_bos, output_bom
-        
-        # return output_bos / self.T, output_bom / self.T   # 进行温度缩放
-
-    def calibrate_test(self, img1, img2):
-        self.eval()  
-        with torch.no_grad():  
-            logits_output_bos, logits_output_bom = self(img1, img2)
-        return logits_output_bos, logits_output_bom
-    
-    def pre_fintune(self):
-        for param in self.model.parameters():
-            param.requires_grad = False  # 冻结模型参数
-        self.T.requires_grad = True  # 确保 T 仍然可训练
-    
     def grid_search_set(self, T_range, dt):
         self.candidate_T_arange = np.arange(T_range[0], T_range[1] + dt, dt)
         self.T_index = 0
-    
+
     def reflash_T(self):
         assert self.T_index < len(self.candidate_T_arange), "已超过可选T范围"
         self.T = nn.Parameter(torch.tensor(self.candidate_T_arange[self.T_index], dtype=torch.float32))
-    
-    def reset_index(self, T_idx = None):
-        if T_idx is not None:
-            self.T_index = T_idx
-        else:
-            self.T_index += 1
-            
+
+    def reset_index(self, T_idx=None):
+        self.T_index = T_idx if T_idx is not None else (self.T_index + 1)
+
     def __len__(self):
         print(f"可选T范围为: {len(self.candidate_T_arange)}")
         return len(self.candidate_T_arange)
-    
 
-        # ======  ETS（三组件凸组合）实现 ======
-    def enable_ets_mix(self,
-                    per_class: bool = False,   # False: 标量温度；True: 按类温度 α_l
-                    init_T: float = 1.0,       # 初始温度（若 per_class=True 则所有类同值）
-                    eps: float = 1e-8):
-        """
-        启用 ETS（三组件：TS + identity + uniform）。不改原 forward 的行为。
-        之后使用 forward_ets_mix / calibrate_test_ets_mix。
-        """
-        self._etsm_enabled = True
-        self._etsm_per_class = bool(per_class)
-        self._etsm_eps = float(eps)
-        # 可训练的权重（3 个），用 softmax 保证在单纯形内
-        self._etsm_w_logits = torch.nn.Parameter(torch.zeros(3, dtype=torch.float32))
-        # 温度用 α=1/T 参数化，正约束：α = softplus(a_raw) + eps
-        # 按类或标量在第一次前向看到类别数后再惰性创建
-        self._etsm_alpha_raw_bos = None
-        self._etsm_alpha_raw_bom = None
-        self._etsm_init_alpha = 1.0 / max(init_T, 1e-6)
-        self._etsm_inited_bos = False
-        self._etsm_inited_bom = False
-
-    def _etsm_softplus_pos(self, x):
+    # ========= ETS 计算 =========
+    def _etsm_softplus_pos(self, x):  # α>0
         return F.softplus(x) + self._etsm_eps
 
     def _etsm_ts_prob(self, p, alpha):
-        """
-        概率域 TS：p^{alpha} / sum p^{alpha}
-        - p: [N,K]
-        - alpha: 标量或 [K]
-        """
+        # p^{alpha} / sum p^{alpha}，alpha: 标量或 [K]
         if alpha.ndim == 0:
             a = alpha.view(1, 1)
         else:
-            a = alpha.view(1, -1)  # [1,K]
+            a = alpha.view(1, -1)
         p_pow = torch.clamp(p, min=self._etsm_eps) ** a
         return p_pow / p_pow.sum(dim=1, keepdim=True)
 
-    def _etsm_lazy_init(self, logits, which='bos'):
+    def _forward_ets_as_logits(self, img1, img2):
         """
-        惰性创建 α 参数：标量或长度为 K 的向量
+        ETS：
+          logits -> p -> q = w1*TS(p;α) + w2*p + w3*uniform
+          返回 log(q) 作为 "logits"（CE/Focal 直接可用）
         """
-        K = logits.shape[1]
-        if which == 'bos' and (not self._etsm_inited_bos):
-            if self._etsm_per_class:
-                self._etsm_alpha_raw_bos = torch.nn.Parameter(
-                    torch.full((K,), fill_value=float(np.log(np.exp(self._etsm_init_alpha)-1.0)),
-                            dtype=torch.float32)
-                )
-            else:
-                self._etsm_alpha_raw_bos = torch.nn.Parameter(
-                    torch.tensor([float(np.log(np.exp(self._etsm_init_alpha)-1.0))], dtype=torch.float32)
-                )
-            self._etsm_inited_bos = True
-        if which == 'bom' and (not self._etsm_inited_bom):
-            if self._etsm_per_class:
-                self._etsm_alpha_raw_bom = torch.nn.Parameter(
-                    torch.full((K,), fill_value=float(np.log(np.exp(self._etsm_init_alpha)-1.0)),
-                            dtype=torch.float32)
-                )
-            else:
-                self._etsm_alpha_raw_bom = torch.nn.Parameter(
-                    torch.tensor([float(np.log(np.exp(self._etsm_init_alpha)-1.0))], dtype=torch.float32)
-                )
-            self._etsm_inited_bom = True
-
-    def forward_ets_mix(self, img1, img2):
-        """
-        ETS 前向：
-        1) 得到原 logits -> 概率 p
-        2) TS(p; α) + identity(p) + uniform 三者按 w 混合
-        3) 返回 log(混合概率) 作为 logits-like
-        """
-        assert getattr(self, "_etsm_enabled", False), "请先调用 enable_ets_mix(...)"
-
+        assert self._etsm_enabled, "请先 set_calibrate_method('ets'/'ets_pc', ...)"
         logits_bos, logits_bom = self.model(img1, img2)
-        w = torch.softmax(self._etsm_w_logits, dim=0)  # [3], >=0 且和为 1
-        # 头1（bos）
+        w = torch.softmax(self._etsm_w_logits, dim=0)  # [3]
+
         out_bos = None
         if logits_bos is not None:
-            self._etsm_lazy_init(logits_bos, 'bos')
-            alpha_bos = self._etsm_softplus_pos(self._etsm_alpha_raw_bos)  # 标量或 [K]
-            p = F.softmax(logits_bos, dim=1)
-            ts = self._etsm_ts_prob(p, alpha_bos)
-            uni = torch.full_like(p, 1.0 / p.shape[1])
-            q = w[0] * ts + w[1] * p + w[2] * uni
-            out_bos = torch.log(q.clamp_min(self._etsm_eps))
-        # 头2（bom）
+            if self._num_classes_bos is not None:
+                assert logits_bos.shape[1] == self._num_classes_bos, \
+                    f"bos 类别数不一致：logits:{logits_bos.shape[1]} vs 配置:{self._num_classes_bos}"
+            if self._etsm_alpha_raw_bos is not None:
+                alpha_bos = self._etsm_softplus_pos(self._etsm_alpha_raw_bos)
+                p = F.softmax(logits_bos, dim=1)
+                ts = self._etsm_ts_prob(p, alpha_bos)
+                uni = torch.full_like(p, 1.0 / p.shape[1])
+                q = w[0] * ts + w[1] * p + w[2] * uni
+                out_bos = torch.log(q.clamp_min(self._etsm_eps))
+            else:
+                out_bos = None  # 未配置 bos
+
         out_bom = None
         if logits_bom is not None:
-            self._etsm_lazy_init(logits_bom, 'bom')
-            alpha_bom = self._etsm_softplus_pos(self._etsm_alpha_raw_bom)
-            p = F.softmax(logits_bom, dim=1)
-            ts = self._etsm_ts_prob(p, alpha_bom)
-            uni = torch.full_like(p, 1.0 / p.shape[1])
-            q = w[0] * ts + w[1] * p + w[2] * uni
-            out_bom = torch.log(q.clamp_min(self._etsm_eps))
+            if self._num_classes_bom is not None:
+                assert logits_bom.shape[1] == self._num_classes_bom, \
+                    f"bom 类别数不一致：logits:{logits_bom.shape[1]} vs 配置:{self._num_classes_bom}"
+            if self._etsm_alpha_raw_bom is not None:
+                alpha_bom = self._etsm_softplus_pos(self._etsm_alpha_raw_bom)
+                p = F.softmax(logits_bom, dim=1)
+                ts = self._etsm_ts_prob(p, alpha_bom)
+                uni = torch.full_like(p, 1.0 / p.shape[1])
+                q = w[0] * ts + w[1] * p + w[2] * uni
+                out_bom = torch.log(q.clamp_min(self._etsm_eps))
+            else:
+                out_bom = None  # 未配置 bom
 
+        self._returns_log_prob = False  # 对外当 logits
         return out_bos, out_bom
-
-    def calibrate_test_ets_mix(self, img1, img2):
-        self.eval()
-        with torch.no_grad():
-            return self.forward_ets_mix(img1, img2)
-
-    def ets_mix_pre_fintune(self):
-        """
-        只训练 ETS 参数（w 与 α），冻结骨干。
-        """
-        for p in self.model.parameters():
-            p.requires_grad = False
-        self._etsm_w_logits.requires_grad = True
-        if self._etsm_inited_bos and (self._etsm_alpha_raw_bos is not None):
-            self._etsm_alpha_raw_bos.requires_grad = True
-        if self._etsm_inited_bom and (self._etsm_alpha_raw_bom is not None):
-            self._etsm_alpha_raw_bom.requires_grad = True
 
 
 # import torch
