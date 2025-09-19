@@ -1666,7 +1666,7 @@ if __name__ == '__main__':
     parser.add_argument('--default_thres', default=0.8, type=float)
 
     parser.add_argument('--ets_per_class', default=False,help='ETS 是否为每个类别单独温度')
-    parser.add_argument('--calibrate_method',type=str, default='ts', choices=['ts', 'ets', 'ets_pc', 'ets-pc'],help='ts: 温度缩放；ets: 三组件；ets_pc: ETS按类温度')
+    parser.add_argument('--calibrate_method',type=str, default='ts', choices=['ts', 'ets', 'ets_pc', 'ets-pc','irova','irova_ts'],help='ts: 温度缩放；ets: 三组件；ets_pc: ETS按类温度; irova: 多分类按类别实现isotonic校准，二分类用温度缩放；irova_ts: 先进行温度缩放后再进行多分类的isotonic校准')
     parser.add_argument('--calibrate_dataset', default='calibrate_test', type=str)
     parser.add_argument('--ECE_calcu_type', default='Multi_ECE', type=str, choices=['ECE', 'Ada_ECE', 'Multi_ECE', 'Multi_Ada_ECE', 'Classwise_ECE', 'Classwise_Ada_ECE', 'KDE', 'Classwise_KDE', 'Multi_KDE', 'TrueKDE'])
 

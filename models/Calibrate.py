@@ -2,6 +2,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+class _IsoMap(nn.Module):
+    """irova:单调回归的分段常数映射：y = step(x)。boundaries:[M-1], values:[M]"""
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("boundaries", torch.empty(0))
+        self.register_buffer("values", torch.empty(0))
+
+    @torch.no_grad()
+    def set_params(self, boundaries: torch.Tensor, values: torch.Tensor):
+        self.boundaries = boundaries.detach().float().reshape(-1)
+        self.values = values.detach().float().reshape(-1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.values.numel() == 0:
+            raise RuntimeError("iROVA 映射尚未拟合（values 为空）")
+        idx = torch.searchsorted(self.boundaries, x, right=True)  # [N], 范围 0..M-1
+        return self.values[idx]  # 逐样本取所在台阶的常数
 
 class Calibrate_Model(nn.Module):
     """
@@ -31,6 +48,16 @@ class Calibrate_Model(nn.Module):
         # 记录类别数，便于校验
         self._num_classes_bos = None
         self._num_classes_bom = None
+        
+        # ===== iROVA 相关 =====
+        self._irova_enabled = False
+        self._irova_use_ts = False     # 是否先做 TS（即 logits/T 再 softmax）
+        self._irova_eps = 1e-8
+        self._irova_bos = None         # nn.ModuleList([_IsoMap]*K_bos)
+        self._irova_bom = None         # nn.ModuleList([_IsoMap]*K_bom)
+        self._irova_fitted_bos = False
+        self._irova_fitted_bom = False
+
 
     # ========= 主入口：由 args 驱动，非惰性创建 α ========= 🔧
     def set_calibrate_method(self, method: str,
@@ -46,28 +73,59 @@ class Calibrate_Model(nn.Module):
           num_classes_bom/bos: 对应头的类别数（ETS 下必需；TS 可忽略）
         """
         method = (method or 'ts').lower()
+              # …先把 ETS 标记清零…
+        self._etsm_enabled = False
+        self._returns_log_prob = False
+        self._irova_enabled = False
+        self._irova_use_ts = False
         if method == 'ts':
             self.calib_method = 'ts'
             self._returns_log_prob = False
             self._etsm_enabled = False
             return
+        if method in ('ets', 'ets_pc', 'ets-pc'):
+            # ETS / ETS_PC
+            if num_classes_bom is None and num_classes_bos is None:
+                raise ValueError("ETS 需要提供 num_classes_bom 或 num_classes_bos（至少一个头的 K）")
 
-        # ETS / ETS_PC
-        if num_classes_bom is None and num_classes_bos is None:
-            raise ValueError("ETS 需要提供 num_classes_bom 或 num_classes_bos（至少一个头的 K）")
+            self._num_classes_bos = num_classes_bos
+            self._num_classes_bom = num_classes_bom
+            self._etsm_per_class = bool(per_class or method in ('ets_pc','ets-pc'))
+            self._etsm_eps = 1e-8
+            self._etsm_enabled = True
+            self._etsm_init_alpha = 1.0 / max(init_T, 1e-6)
 
-        self._num_classes_bos = num_classes_bos
-        self._num_classes_bom = num_classes_bom
-        self._etsm_per_class = bool(per_class or method in ('ets_pc','ets-pc'))
-        self._etsm_eps = 1e-8
-        self._etsm_enabled = True
-        self._etsm_init_alpha = 1.0 / max(init_T, 1e-6)
+            # 立即创建参数（非惰性） 🔧
+            self._create_ets_params()
 
-        # 立即创建参数（非惰性） 🔧
-        self._create_ets_params()
-
-        self.calib_method = 'ets_pc' if self._etsm_per_class else 'ets'
-        self._returns_log_prob = False  # 对外仍然当作 logits 用
+            self.calib_method = 'ets_pc' if self._etsm_per_class else 'ets'
+            self._returns_log_prob = False  # 对外仍然当作 logits 用
+            return
+        
+        if method == 'irova_ts':
+            self.calib_method = 'irova_ts'
+            self._irova_enabled = True
+            self._irova_use_ts = True
+            self._num_classes_bos = num_classes_bos
+            self._num_classes_bom = num_classes_bom
+            if num_classes_bos is not None and self._irova_bos is None:
+                self._irova_bos = nn.ModuleList([_IsoMap() for _ in range(num_classes_bos)])
+            if num_classes_bom is not None and self._irova_bom is None:
+                self._irova_bom = nn.ModuleList([_IsoMap() for _ in range(num_classes_bom)])
+            return
+        
+        if method == 'irova':
+            self.calib_method = 'irova'
+            self._irova_enabled = True
+            self._irova_use_ts = False
+            self._num_classes_bos = num_classes_bos
+            self._num_classes_bom = num_classes_bom
+            if num_classes_bos is not None and self._irova_bos is None:
+                self._irova_bos = nn.ModuleList([_IsoMap() for _ in range(num_classes_bos)])
+            if num_classes_bom is not None and self._irova_bom is None:
+                self._irova_bom = nn.ModuleList([_IsoMap() for _ in range(num_classes_bom)])
+            return 
+        
     def _infer_device(self):
         # 取已有参数的 device；优先骨干，其次 T
         for p in self.model.parameters():
@@ -103,12 +161,16 @@ class Calibrate_Model(nn.Module):
     def forward(self, img1, img2):
         if self.calib_method.startswith('ets') and self._etsm_enabled:
             return self._forward_ets_as_logits(img1, img2)
+        
+        if self.calib_method.startswith('ts'):
 
-        # TS：返回 logits / T
-        logits_bos, logits_bom = self.model(img1, img2)
-        out_bos = None if logits_bos is None else logits_bos / self.T
-        out_bom = None if logits_bom is None else logits_bom / self.T
-        self._returns_log_prob = False
+            # TS：返回 logits / T
+            logits_bos, logits_bom = self.model(img1, img2)
+            out_bos = None if logits_bos is None else logits_bos / self.T
+            out_bom = None if logits_bom is None else logits_bom / self.T
+            self._returns_log_prob = False
+        if self._irova_enabled:  # 覆盖 irova / irova_ts
+            return self._forward_irova_as_logits(img1, img2)
         return out_bos, out_bom
 
     def calibrate_test(self, img1, img2):
@@ -123,7 +185,7 @@ class Calibrate_Model(nn.Module):
 
         if self.calib_method == 'ts':
             self.T.requires_grad = True
-        else:
+        elif self.calib_method.startswith('ets'):
             # ETS：w 与 α 可训练（非惰性时必定已存在）
             assert self._etsm_w_logits is not None, "ETS 参数未初始化；请先 set_calibrate_method(..., num_classes_*)"
             self._etsm_w_logits.requires_grad = True
@@ -133,7 +195,18 @@ class Calibrate_Model(nn.Module):
                 self._etsm_alpha_raw_bom.requires_grad = True
             # 如需同时学校准全局 T，可打开：
             # self.T.requires_grad = True
-
+        elif self.calib_method.startswith('irova'):
+            # iROVA：T 可训练
+            self.T.requires_grad = True
+            # iROVA 映射不可微，故不训练
+            if self._irova_bos is not None:
+                for m in self._irova_bos:
+                    for p in m.parameters():
+                        p.requires_grad = False
+            if self._irova_bom is not None:
+                for m in self._irova_bom:
+                    for p in m.parameters():
+                        p.requires_grad = False
     # ========= 其他工具（保持你原来的） =========
     def compile_model(self):
         self.model = torch.jit.script(self.model)
@@ -208,7 +281,154 @@ class Calibrate_Model(nn.Module):
 
         self._returns_log_prob = False  # 对外当 logits
         return out_bos, out_bom
+    
+      # ===== iROVA：PAV 拟合一条单调函数，输出边界与台阶值 =====
 
+    @staticmethod
+    def _pav_isotonic_fit(x_np: np.ndarray, y_np: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """
+        PAV 拟合单调函数，返回 (boundaries, values)
+        - boundaries: [M-1] 分段点
+        - values: [M] 每段的常数值
+        输入：x_np∈[0,1]^N（自信度），y_np∈{0,1}^N（是否为该类）
+        输出：boundaries:[M-1], values:[M]（非降阶梯）
+        """
+        x = np.asarray(x_np, dtype=np.float64)
+        y = np.asarray(y_np, dtype=np.float64)
+        oder = np.argsort(x, kind='mergesort')
+
+        x , y = x[oder], y[oder]
+        # 初始化
+    
+        sum_w = np.ones_like(y)
+        sum_y = y.copy()
+        mean = sum_y / np.maximum(sum_w, 1e-12)
+
+        # 栈实现 PAV
+        sw, sy, sm, L, R = [], [], [], [], []
+        for i in range(len(x)):
+            sw.append(sum_w[i])
+            sy.append(sum_y[i])
+            sm.append(mean[i])
+            L.append(i)
+            R.append(i)
+            # 合并
+            while len(sm) >= 2 and sm[-2] > sm[-1] + 1e-12:
+                w2, y2, m2, l2, r2 = sw.pop(), sy.pop(), sm.pop(), L.pop(), R.pop()
+                w1, y1, m1, l1, r1 = sw.pop(), sy.pop(), sm.pop(), L.pop(), R.pop()
+                w = w1 + w2; yv = y1 + y2; m = yv / max(w, 1e-12)
+                sw.append(w); sy.append(yv); sm.append(m); L.append(l1); R.append(r2)
+        
+        M = len(sm)
+        boundaries = []
+        for k in range(M - 1):
+            b = (x[R[k]] + x[L[k + 1]]) / 2.0
+            boundaries.append(b)
+        boundaries = np.array(boundaries, dtype=np.float64)
+        values = np.clip(np.array(sm, dtype=np.float64), 0.0, 1.0
+        )
+
+
+
+
+        return boundaries, values
+    
+
+    @torch.no_grad()
+    def fit_irova(self, head: str, logits: torch.Tensor, labels: torch.Tensor, use_temperature: bool = None):
+        """
+        在验证集上拟合 iROVA 阶梯：
+          head: 'bos' 或 'bom'
+          logits: [N,K]（该头的 logits）
+          labels: [N]（0..K-1）
+          use_temperature: 若为 None，随当前模式（irova_ts=True, irova=False）
+        """
+     
+        if use_temperature is None:
+            use_temperature = self._irova_use_ts
+
+        N, K = logits.shape
+        device = logits.device
+
+        if head.lower() == 'bos':
+            if self._irova_bos is None:
+                self._irova_bos = nn.ModuleList([_IsoMap() for _ in range(K)])
+        
+        elif head.lower() == 'bom':
+            if self._irova_bom is None:
+                self._irova_bom = nn.ModuleList([_IsoMap() for _ in range(K)])
+        else:
+            raise ValueError("head 必须为 'bos' 或 'bom'")
+        
+        if use_temperature:
+            p = F.softmax(logits / self.T, dim=1)
+        else:
+            p = F.softmax(logits, dim=1)
+        y = labels.long().view(-1).detach().cpu().numpy()
+
+
+        p_np = p.detach().cpu().numpy()
+        for k in range(K):
+            x_k = p_np[:, k]
+            y_k = (y == k).astype(np.float64)
+            bnd, val = self._pav_isotonic_fit(x_k, y_k)
+            bnd_t = torch.tensor(bnd, dtype=torch.float32, device=device)
+            val_t = torch.tensor(val, dtype=torch.float32, device=device)
+            if head.lower() == 'bos':
+                self._irova_bos[k].set_params(bnd_t, val_t)
+            else:
+                self._irova_bom[k].set_params(bnd_t, val_t)
+        
+        if head.lower() == 'bos':
+            self._irova_fitted_bos = True
+
+        else:
+            self._irova_fitted_bom = True
+    
+    def _forward_irova_as_logits(self, img1, img2):
+        """
+        iROVA：
+          logits -> p -> q = iROVA(p)
+          返回 log(q) 作为 "logits"（CE/Focal 直接可用）
+        """
+        logits_bos, logits_bom = self.model(img1, img2)
+
+        out_bos = None
+        if logits_bos is not None and self._irova_bos is not None:
+            if self._num_classes_bos is not None:
+                assert logits_bos.shape[1] == self._num_classes_bos, \
+                    f"bos 类别数不一致：logits:{logits_bos.shape[1]} vs 配置:{self._num_classes_bos}"
+                
+            if not self._irova_fitted_bos or self._irova_bos is None:
+                raise RuntimeError("bos 头的 iROVA 尚未拟合，请先调用 fit_irova('bos', ...)")
+            
+
+            p = F.softmax(logits_bos / self.T if self._irova_use_ts else logits_bos, dim=1)
+            qs = [self._irova_bos[k](p[:, k]) for k in range(logits_bos.shape[1])]
+            q_tilde = torch.stack(qs, dim=1)
+            denom = q_tilde.sum(dim=1, keepdim=True).clamp_min(self._irova_eps)
+            q = q_tilde / denom
+            out_bos = torch.log(q.clamp_min(self._irova_eps))
+
+        out_bom = None
+        if logits_bom is not None and self._irova_bom is not None:
+            if self._num_classes_bom is not None:
+                assert logits_bom.shape[1] == self._num_classes_bom, \
+                    f"bom 类别数不一致：logits:{logits_bom.shape[   1]} vs 配置:{self._num_classes_bom}"
+            if not self._irova_fitted_bom or self._irova_bom is None:
+                raise RuntimeError("bom 头的 iROVA 尚未拟合，请先调用 fit_irova('bom', ...)")
+            
+            p = F.softmax(logits_bom / self.T if self._irova_use_ts else logits_bom, dim=1)
+            qs = [self._irova_bom[k](p[:, k]) for k in range(logits_bom.shape[1])]
+            q_tilde = torch.stack(qs, dim=1)
+            denom = q_tilde.sum(dim=1, keepdim=True).clamp_min(self._irova_eps)
+            q = q_tilde / denom
+            out_bom = torch.log(q.clamp_min(self._irova_eps))
+            
+        self._returns_log_prob = False  # 对外当 logits
+        return out_bos, out_bom
+
+        
 
 # import torch
 # import torch.nn as nn
