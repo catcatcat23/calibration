@@ -663,7 +663,7 @@ class KDEer:
     def __init__(self,
                  kde_grid_points: int = 201,
                  kde_bandwidth: Optional[float] = None,
-                 kde_reflect: bool = False,
+                 kde_reflect: bool = True,
                  eps: float = 1e-8,
                  # 新增稳化超参
                  kde_bandwidth_scale: float = 2.0,   # Silverman 带宽放大倍数
